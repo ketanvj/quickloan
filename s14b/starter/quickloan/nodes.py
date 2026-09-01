@@ -8,6 +8,7 @@ Session 14b: upgrades Layer 2 of the input guard from Llama Prompt Guard 2
 
 S14b TODO: implement _llamaguard_safe(), guard(), blocked(), route_guard().
 """
+import base64
 import re
 import sqlite3
 import unicodedata
@@ -63,6 +64,32 @@ def _init_vectorstore() -> None:
         print("  Run 'python data/ingest.py' to create it.")
 
 
+def _try_decode(text: str) -> str:
+    """Decode Base64 or hex-encoded text before guard checks.
+    Catches obfuscation attacks like base64("ignore previous instructions").
+    Returns decoded text if decoding succeeds and changes the input; original text otherwise.
+    """
+    stripped = text.strip()
+    # Base64
+    try:
+        padding = (4 - len(stripped) % 4) % 4
+        decoded = base64.b64decode(stripped + "=" * padding).decode("utf-8", errors="strict")
+        if decoded != stripped and len(decoded) >= 8 and decoded.isprintable():
+            return decoded
+    except Exception:
+        pass
+    # Hex
+    try:
+        hex_clean = stripped.replace(" ", "")
+        if len(hex_clean) >= 16 and all(c in "0123456789abcdefABCDEF" for c in hex_clean):
+            decoded = bytes.fromhex(hex_clean).decode("utf-8", errors="strict")
+            if decoded.isprintable():
+                return decoded
+    except Exception:
+        pass
+    return text
+
+
 # ---------------------------------------------------------------------------
 # S14b TODO: implement the four guard functions below
 # ---------------------------------------------------------------------------
@@ -96,6 +123,7 @@ def guard(state: QuickLoanState) -> dict:
     Two-layer defence:
       Preprocessing:
         - NFKD normalize: msg = unicodedata.normalize("NFKD", raw)
+        - Decode obfuscation: decoded = _try_decode(msg); if decoded != msg → use decoded
       Layer 1 (regex, < 1 ms):
         1a. Loop through _pii_compiled. If any match → return {"blocked_reason": "pii"}
         1b. Loop through _injection_compiled. If any match → return {"blocked_reason": "injection"}
@@ -278,8 +306,20 @@ def _load_valid_rates() -> set:
 
 
 def _extract_rates(text: str) -> list:
-    matches = re.findall(r"(\d+\.?\d*)\s*%\s*p\.a\.", text, re.IGNORECASE)
-    return [float(m) for m in matches]
+    rates = []
+    # Standard percentage p.a. format: "8.5% p.a." or "8.50 % p.a."
+    for m in re.findall(r"(\d+\.?\d*)\s*%\s*p\.a\.", text, re.IGNORECASE):
+        try:
+            rates.append(round(float(m), 2))
+        except ValueError:
+            pass
+    # Basis points: "200bps", "200 bps", "200 basis points" → 2.00% p.a.
+    for m in re.findall(r"(\d+)\s*(?:bps|basis\s+points)", text, re.IGNORECASE):
+        try:
+            rates.append(round(float(m) / 100, 2))
+        except ValueError:
+            pass
+    return rates
 
 
 @traceable(name="rbi_compliance_check")

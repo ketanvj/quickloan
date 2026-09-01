@@ -18,6 +18,7 @@ Supervisor routes unchanged from S13/S14:
   - Rates Agent    -- MCP tools (query_rates, query_eligibility)
   - Compliance Agent (sub-graph): check_rbi → [revise | END]
 """
+import base64
 import re
 import sqlite3
 import unicodedata
@@ -84,6 +85,32 @@ def _init_vectorstore() -> None:
 #   - We DO block on all other categories: S1–S5, S7–S13
 # ---------------------------------------------------------------------------
 
+def _try_decode(text: str) -> str:
+    """Decode Base64 or hex-encoded text before guard checks.
+    Catches obfuscation attacks like base64("ignore previous instructions").
+    Returns decoded text if decoding succeeds and changes the input; original text otherwise.
+    """
+    stripped = text.strip()
+    # Base64
+    try:
+        padding = (4 - len(stripped) % 4) % 4
+        decoded = base64.b64decode(stripped + "=" * padding).decode("utf-8", errors="strict")
+        if decoded != stripped and len(decoded) >= 8 and decoded.isprintable():
+            return decoded
+    except Exception:
+        pass
+    # Hex
+    try:
+        hex_clean = stripped.replace(" ", "")
+        if len(hex_clean) >= 16 and all(c in "0123456789abcdefABCDEF" for c in hex_clean):
+            decoded = bytes.fromhex(hex_clean).decode("utf-8", errors="strict")
+            if decoded.isprintable():
+                return decoded
+    except Exception:
+        pass
+    return text
+
+
 def _llamaguard_safe(message: str) -> bool:
     """Call LlamaGuard 3 8B and return True if the message is safe.
 
@@ -133,6 +160,11 @@ def guard(state: QuickLoanState) -> dict:
     """
     raw = state["customer_message"]
     msg = unicodedata.normalize("NFKD", raw)
+
+    decoded = _try_decode(msg)
+    if decoded != msg:
+        print(f"[QuickLoan] Guard: obfuscated input decoded ({len(msg)}→{len(decoded)} chars)")
+        msg = decoded
 
     # Layer 1a: PII — identifier must not reach the LLM.
     for rx in _pii_compiled:
@@ -325,8 +357,20 @@ def _load_valid_rates() -> set:
 
 
 def _extract_rates(text: str) -> list:
-    matches = re.findall(r"(\d+\.?\d*)\s*%\s*p\.a\.", text, re.IGNORECASE)
-    return [float(m) for m in matches]
+    rates = []
+    # Standard percentage p.a. format: "8.5% p.a." or "8.50 % p.a."
+    for m in re.findall(r"(\d+\.?\d*)\s*%\s*p\.a\.", text, re.IGNORECASE):
+        try:
+            rates.append(round(float(m), 2))
+        except ValueError:
+            pass
+    # Basis points: "200bps", "200 bps", "200 basis points" → 2.00% p.a.
+    for m in re.findall(r"(\d+)\s*(?:bps|basis\s+points)", text, re.IGNORECASE):
+        try:
+            rates.append(round(float(m) / 100, 2))
+        except ValueError:
+            pass
+    return rates
 
 
 @traceable(name="rbi_compliance_check")
