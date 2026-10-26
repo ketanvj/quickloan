@@ -1,5 +1,0 @@
-{
-  "graphs": {
-    "quickloan": "quickloan.agent:graph"
-  }
-}

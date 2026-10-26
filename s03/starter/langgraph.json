@@ -1,1 +1,0 @@
-{"dependencies": ["."], "graphs": {"quickloan": "quickloan.agent:graph"}, "env": "../../.env"}
